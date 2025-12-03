@@ -50,9 +50,9 @@ pub async fn register(
 ) -> Result<Json<Value>, AppError> {
     // Check ALLOWED_EMAILS if it's set and not empty
     // If not set or empty, allow any email to register
-    if let Ok(allowed_emails) = env.secret("ALLOWED_EMAILS") {
-        if let Some(allowed_emails) = allowed_emails.as_ref().as_string() {
-            let allowed_emails = allowed_emails.trim();
+    if let Ok(allowed_emails_secret) = env.secret("ALLOWED_EMAILS") {
+        if let Some(allowed_emails_str) = allowed_emails_secret.as_ref().as_string() {
+            let allowed_emails = allowed_emails_str.trim();
             if !allowed_emails.is_empty()
                 && allowed_emails
                     .split(',')
