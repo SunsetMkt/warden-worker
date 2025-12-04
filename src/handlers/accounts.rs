@@ -1,5 +1,6 @@
 use axum::{extract::State, Json};
 use chrono::Utc;
+use glob_match::glob_match;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -88,9 +89,9 @@ pub async fn register(
         .as_ref()
         .as_string()
         .ok_or_else(|| AppError::Internal)?;
-    if allowed_emails
-        .split(",")
-        .all(|email| email.trim() != payload.email)
+    if !allowed_emails
+        .split(',')
+        .any(|pattern| glob_match(pattern.trim(), &payload.email))
     {
         return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
     }
