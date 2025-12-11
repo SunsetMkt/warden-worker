@@ -48,6 +48,16 @@ There are no immediate plans to implement these features. The primary goal of th
 * **Android App:** The official Bitwarden Android app. (Tested 2025.11.0)
 * **iOS App:** The official Bitwarden iOS app. (Tested 2025.11.0)
 
+## Demo
+
+A demo instance is available at [warden.qqnt.de](https://warden.qqnt.de).
+
+You can register a new account using an email ending with `@warden-worker.demo` (The email does not need verification).
+
+If you decide to stop using the demo instance, please delete your account to make space for others.
+
+It's highly recommended to deploy your own instance since the demo can hit the rate limit and be disabled by Cloudflare.
+
 ## Getting Started
 
 - Choose a deployment path: [CLI Deployment](docs/deployment.md#cli-deployment) or [Github Actions Deployment](docs/deployment.md#cicd-deployment-with-github-actions).
