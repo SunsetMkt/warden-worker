@@ -12,8 +12,7 @@ use crate::{
     db,
     error::AppError,
     handlers::{
-        allow_totp_drift,
-        server_password_iterations,
+        allow_totp_drift, server_password_iterations,
         twofactor::{is_twofactor_enabled, list_user_twofactors},
     },
     models::twofactor::{RememberTokenData, TwoFactor, TwoFactorType},
@@ -267,7 +266,9 @@ pub async fn token(
                     Some(code) => code,
                     None => {
                         // Return 2FA required error
-                        return Err(AppError::TwoFactorRequired(json_err_twofactor(&twofactor_ids)));
+                        return Err(AppError::TwoFactorRequired(json_err_twofactor(
+                            &twofactor_ids,
+                        )));
                     }
                 };
 
@@ -278,7 +279,9 @@ pub async fn token(
                             .find(|tf| {
                                 tf.enabled && tf.atype == TwoFactorType::Authenticator as i32
                             })
-                            .ok_or_else(|| AppError::BadRequest("TOTP not configured".to_string()))?;
+                            .ok_or_else(|| {
+                                AppError::BadRequest("TOTP not configured".to_string())
+                            })?;
 
                         // Validate TOTP code
                         let allow_drift = allow_totp_drift(&env);

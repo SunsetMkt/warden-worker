@@ -6,8 +6,8 @@ use std::sync::Arc;
 use worker::Env;
 
 use crate::handlers::{
-    accounts, attachments, ciphers, config, devices, domains, emergency_access, folders, identity, import,
-    meta, sync, twofactor, webauth,
+    accounts, attachments, ciphers, config, devices, domains, emergency_access, folders, identity,
+    import, meta, sync, twofactor, webauth,
 };
 
 pub fn api_router(env: Env) -> Router {

@@ -35,9 +35,9 @@ pub(crate) async fn list_user_twofactors(
 /// For now, we intentionally only treat Authenticator (TOTP) as a real 2FA provider.
 /// Remember-device tokens are never considered a 2FA method by themselves.
 pub(crate) fn is_twofactor_enabled(twofactors: &[TwoFactor]) -> bool {
-    twofactors.iter().any(|tf| {
-        tf.enabled && tf.atype == TwoFactorType::Authenticator as i32
-    })
+    twofactors
+        .iter()
+        .any(|tf| tf.enabled && tf.atype == TwoFactorType::Authenticator as i32)
 }
 
 /// GET /api/two-factor - Get all enabled 2FA providers for current user

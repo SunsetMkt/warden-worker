@@ -19,9 +19,7 @@ pub async fn now() -> Json<String> {
 ///
 /// Simple healthcheck. Vaultwarden uses this to also verify DB connectivity.
 #[worker::send]
-pub async fn alive(
-    State(env): State<Arc<Env>>,
-) -> Result<Json<String>, AppError> {
+pub async fn alive(State(env): State<Arc<Env>>) -> Result<Json<String>, AppError> {
     // Verify D1 binding is present + basic query works.
     let db = db::get_db(&env)?;
     db.prepare("SELECT 1 as ok")
@@ -54,5 +52,3 @@ pub struct HibpBreachQuery {
 pub async fn hibp_breach(_query: axum::extract::Query<HibpBreachQuery>) -> Json<Value> {
     Json(json!([]))
 }
-
-
