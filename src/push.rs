@@ -7,9 +7,10 @@ use worker::{
     wasm_bindgen::JsValue, Cache, Env, Fetch, Headers, Method, Request, RequestInit, Response,
 };
 
+use crate::db;
 use crate::{error::AppError, models::device::Device};
 
-const PUSH_TOKEN_CACHE_URL: &str = "https://push-token.internal/relay-token";
+const PUSH_TOKEN_CACHE_BASE: &str = "https://push-token.internal/relay-token";
 const DEFAULT_PUSH_RELAY_URI: &str = "https://push.bitwarden.com";
 const DEFAULT_PUSH_IDENTITY_URI: &str = "https://identity.bitwarden.com";
 
@@ -118,10 +119,20 @@ async fn fetch_relay_token(cfg: &PushConfig) -> Result<(String, i32), AppError> 
     Ok((token.access_token, token.expires_in))
 }
 
+fn push_cache_url(cfg: &PushConfig) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    cfg.identity_uri.hash(&mut h);
+    cfg.installation_id.hash(&mut h);
+    cfg.installation_key.hash(&mut h);
+    format!("{}?h={:x}", PUSH_TOKEN_CACHE_BASE, h.finish())
+}
+
 async fn get_relay_token(cfg: &PushConfig) -> Result<String, AppError> {
+    let cache_url = push_cache_url(cfg);
     let cache = Cache::default();
     if let Some(mut cached) = cache
-        .get(PUSH_TOKEN_CACHE_URL, false)
+        .get(&cache_url, false)
         .await
         .map_err(AppError::Worker)?
     {
@@ -146,7 +157,7 @@ async fn get_relay_token(cfg: &PushConfig) -> Result<String, AppError> {
     let response = Response::ok(&access_token)
         .map_err(AppError::Worker)?
         .with_headers(headers);
-    let _ = cache.put(PUSH_TOKEN_CACHE_URL, response).await;
+    let _ = cache.put(&cache_url, response).await;
 
     Ok(access_token)
 }
@@ -393,4 +404,204 @@ async fn post_to_relay(
         }
     }
     Ok(())
+}
+
+// ── D1 queries (push device checks) ────────────────────────────
+
+pub async fn user_has_push_device(env: &Env, user_id: &str) -> Result<bool, AppError> {
+    let db = db::get_db(env)?;
+    let count: Option<f64> = db
+        .prepare(
+            "SELECT COUNT(*) as cnt FROM devices WHERE user_id = ?1 AND push_token IS NOT NULL",
+        )
+        .bind(&[user_id.into()])
+        .map_err(AppError::Worker)?
+        .first(Some("cnt"))
+        .await
+        .map_err(|_| AppError::Database)?;
+    Ok(count.unwrap_or(0.0) > 0.0)
+}
+
+pub async fn lookup_device_push_info(
+    env: &Env,
+    user_id: &str,
+    device_identifier: &str,
+) -> Result<Option<DevicePushInfo>, AppError> {
+    let db = db::get_db(env)?;
+    let row: Option<Value> = db
+        .prepare("SELECT push_uuid, identifier FROM devices WHERE identifier = ?1 AND user_id = ?2")
+        .bind(&[device_identifier.into(), user_id.into()])
+        .map_err(AppError::Worker)?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+    Ok(row.and_then(|r| serde_json::from_value(r).ok()))
+}
+
+// ── Push notification helpers ───────────────────────────────────
+
+fn try_get_push_config(env: &Env) -> Option<PushConfig> {
+    match push_config(env) {
+        Ok(Some(cfg)) => Some(cfg),
+        Ok(None) => None,
+        Err(e) => {
+            log::error!("Push config error: {e}");
+            None
+        }
+    }
+}
+
+async fn resolve_device_info(
+    env: &Env,
+    user_id: &str,
+    context_id: Option<&str>,
+) -> Option<DevicePushInfo> {
+    let ctx = context_id?;
+    lookup_device_push_info(env, user_id, ctx)
+        .await
+        .ok()
+        .flatten()
+}
+
+// ── High-level push functions (called from notification entry points) ──
+
+pub async fn push_user_update(
+    env: &Env,
+    user_id: &str,
+    update_type: i32,
+    date: &str,
+    context_id: Option<&str>,
+) {
+    let Some(cfg) = try_get_push_config(env) else {
+        return;
+    };
+    if !user_has_push_device(env, user_id).await.unwrap_or(false) {
+        return;
+    }
+    let device = resolve_device_info(env, user_id, context_id).await;
+    let payload = build_user_push_payload(user_id, date, update_type, device.as_ref());
+    if let Err(e) = send_to_push_relay(&cfg, &payload).await {
+        log::warn!("Push relay failed for user_update: {e}");
+    }
+}
+
+pub async fn push_folder_update(
+    env: &Env,
+    user_id: &str,
+    update_type: i32,
+    folder_id: &str,
+    revision_date: &str,
+    context_id: Option<&str>,
+) {
+    let Some(cfg) = try_get_push_config(env) else {
+        return;
+    };
+    if !user_has_push_device(env, user_id).await.unwrap_or(false) {
+        return;
+    }
+    let device = resolve_device_info(env, user_id, context_id).await;
+    let payload = build_folder_push_payload(
+        user_id,
+        folder_id,
+        revision_date,
+        update_type,
+        device.as_ref(),
+    );
+    if let Err(e) = send_to_push_relay(&cfg, &payload).await {
+        log::warn!("Push relay failed for folder_update: {e}");
+    }
+}
+
+pub async fn push_cipher_update(
+    env: &Env,
+    user_id: &str,
+    update_type: i32,
+    cipher_id: &str,
+    payload_user_id: Option<&str>,
+    revision_date: Option<&str>,
+    context_id: Option<&str>,
+) {
+    let Some(cfg) = try_get_push_config(env) else {
+        return;
+    };
+    if !user_has_push_device(env, user_id).await.unwrap_or(false) {
+        return;
+    }
+    let device = resolve_device_info(env, user_id, context_id).await;
+    let payload = build_cipher_push_payload(
+        user_id,
+        cipher_id,
+        payload_user_id,
+        revision_date,
+        update_type,
+        device.as_ref(),
+    );
+    if let Err(e) = send_to_push_relay(&cfg, &payload).await {
+        log::warn!("Push relay failed for cipher_update: {e}");
+    }
+}
+
+pub async fn push_send_update(
+    env: &Env,
+    user_id: &str,
+    update_type: i32,
+    send_id: &str,
+    payload_user_id: Option<&str>,
+    revision_date: &str,
+) {
+    let Some(cfg) = try_get_push_config(env) else {
+        return;
+    };
+    if !user_has_push_device(env, user_id).await.unwrap_or(false) {
+        return;
+    }
+    let payload = build_send_push_payload(
+        user_id,
+        send_id,
+        payload_user_id,
+        revision_date,
+        update_type,
+        None,
+    );
+    if let Err(e) = send_to_push_relay(&cfg, &payload).await {
+        log::warn!("Push relay failed for send_update: {e}");
+    }
+}
+
+pub async fn push_auth_request(
+    env: &Env,
+    user_id: &str,
+    auth_request_id: &str,
+    context_id: Option<&str>,
+) {
+    let Some(cfg) = try_get_push_config(env) else {
+        return;
+    };
+    if !user_has_push_device(env, user_id).await.unwrap_or(false) {
+        return;
+    }
+    let device = resolve_device_info(env, user_id, context_id).await;
+    let payload = build_auth_request_push_payload(user_id, auth_request_id, 15, device.as_ref());
+    if let Err(e) = send_to_push_relay(&cfg, &payload).await {
+        log::warn!("Push relay failed for auth_request: {e}");
+    }
+}
+
+pub async fn push_auth_response(
+    env: &Env,
+    user_id: &str,
+    auth_request_id: &str,
+    context_id: Option<&str>,
+) {
+    let Some(cfg) = try_get_push_config(env) else {
+        return;
+    };
+    if !user_has_push_device(env, user_id).await.unwrap_or(false) {
+        return;
+    }
+    let device = resolve_device_info(env, user_id, context_id).await;
+    let payload = build_auth_request_push_payload(user_id, auth_request_id, 16, device.as_ref());
+    if let Err(e) = send_to_push_relay(&cfg, &payload).await {
+        log::warn!("Push relay failed for auth_response: {e}");
+    }
 }

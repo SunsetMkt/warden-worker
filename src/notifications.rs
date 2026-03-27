@@ -6,9 +6,9 @@ use rmpv::Value;
 use serde::{Deserialize, Serialize};
 use worker::{wasm_bindgen::JsValue, Env, Method, Request, RequestInit};
 
-use crate::error::AppError;
+use crate::{error::AppError, push};
 
-const INTERNAL_PUBLISH_URL: &str = "https://notify.internal/publish";
+const INTERNAL_FANOUT_URL: &str = "https://notify.internal/fanout";
 pub const RECORD_SEPARATOR: u8 = 0x1e;
 pub const INITIAL_RESPONSE: [u8; 3] = [b'{', b'}', RECORD_SEPARATOR];
 pub const USER_KIND_TAG: &str = "k:user";
@@ -123,86 +123,6 @@ impl PublishSelector {
             PublishSelector::ByAnonymousToken { token } => anonymous_tag(token),
         }
     }
-}
-
-// ── Internal publish protocol (structured events) ───────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum InternalPublishRequest {
-    UserUpdate(UserUpdatePublish),
-    FolderUpdate(FolderUpdatePublish),
-    CipherUpdate(CipherUpdatePublish),
-    SendUpdate(SendUpdatePublish),
-    AuthRequest(AuthRequestPublish),
-    AuthResponse(AuthResponsePublish),
-    AnonymousAuthResponse(AnonymousAuthResponsePublish),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserUpdatePublish {
-    pub user_id: String,
-    pub update_type: i32,
-    pub date: String,
-    pub context_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FolderUpdatePublish {
-    pub user_id: String,
-    pub update_type: i32,
-    pub folder_id: String,
-    pub revision_date: String,
-    pub context_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CipherUpdatePublish {
-    pub user_id: String,
-    pub update_type: i32,
-    pub cipher_id: String,
-    pub payload_user_id: Option<String>,
-    pub organization_id: Option<String>,
-    pub collection_ids: Option<Vec<String>>,
-    pub revision_date: Option<String>,
-    pub context_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SendUpdatePublish {
-    pub user_id: String,
-    pub update_type: i32,
-    pub send_id: String,
-    pub payload_user_id: Option<String>,
-    pub revision_date: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthRequestPublish {
-    pub user_id: String,
-    pub auth_request_id: String,
-    pub context_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthResponsePublish {
-    pub user_id: String,
-    pub auth_request_id: String,
-    pub context_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AnonymousAuthResponsePublish {
-    pub token: String,
-    pub user_id: String,
-    pub auth_request_id: String,
 }
 
 // ── Tag helpers ─────────────────────────────────────────────────────
@@ -384,6 +304,58 @@ pub fn build_anonymous_auth_response_message(user_id: &str, auth_request_id: &st
     )
 }
 
+// ── DO fan-out protocol ─────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct DoFanoutRequest<'a> {
+    selector: &'a PublishSelector,
+    message: String,
+}
+
+async fn send_ws_to_do(
+    env: &Env,
+    selector: &PublishSelector,
+    ws_bytes: &[u8],
+) -> Result<(), AppError> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let namespace = env.durable_object("NOTIFY_DO").map_err(AppError::Worker)?;
+    let stub = namespace.get_by_name("global").map_err(AppError::Worker)?;
+
+    let body = serde_json::to_string(&DoFanoutRequest {
+        selector,
+        message: STANDARD.encode(ws_bytes),
+    })
+    .map_err(|_| AppError::Internal)?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_body(Some(JsValue::from_str(&body)));
+
+    let mut request =
+        Request::new_with_init(INTERNAL_FANOUT_URL, &init).map_err(AppError::Worker)?;
+    request
+        .headers_mut()
+        .map_err(AppError::Worker)?
+        .set("Content-Type", "application/json")
+        .map_err(AppError::Worker)?;
+
+    let mut response = stub
+        .fetch_with_request(request)
+        .await
+        .map_err(AppError::Worker)?;
+    if !(200..300).contains(&response.status_code()) {
+        let body = response.text().await.unwrap_or_else(|_| String::new());
+        return Err(AppError::Worker(worker::Error::RustError(format!(
+            "NotifyDo fanout failed with status {}: {}",
+            response.status_code(),
+            body
+        ))));
+    }
+
+    Ok(())
+}
+
 // ── Publish helpers (called by handlers) ────────────────────────────
 
 pub async fn publish_user_update(
@@ -393,16 +365,11 @@ pub async fn publish_user_update(
     date: &str,
     context_id: Option<&str>,
 ) -> Result<(), AppError> {
-    publish_internal(
-        env,
-        &InternalPublishRequest::UserUpdate(UserUpdatePublish {
-            user_id: user_id.to_string(),
-            update_type: update_type as i32,
-            date: date.to_string(),
-            context_id: context_id.map(str::to_owned),
-        }),
-    )
-    .await
+    let ws_bytes = build_user_update_message(update_type as i32, user_id, date, context_id);
+    let selector = PublishSelector::user(user_id);
+    send_ws_to_do(env, &selector, &ws_bytes).await?;
+    push::push_user_update(env, user_id, update_type as i32, date, context_id).await;
+    Ok(())
 }
 
 pub async fn publish_user_logout(
@@ -422,17 +389,25 @@ pub async fn publish_folder_update(
     revision_date: &str,
     context_id: Option<&str>,
 ) -> Result<(), AppError> {
-    publish_internal(
+    let ws_bytes = build_folder_update_message(
+        update_type as i32,
+        folder_id,
+        user_id,
+        revision_date,
+        context_id,
+    );
+    let selector = PublishSelector::user(user_id);
+    send_ws_to_do(env, &selector, &ws_bytes).await?;
+    push::push_folder_update(
         env,
-        &InternalPublishRequest::FolderUpdate(FolderUpdatePublish {
-            user_id: user_id.to_string(),
-            update_type: update_type as i32,
-            folder_id: folder_id.to_string(),
-            revision_date: revision_date.to_string(),
-            context_id: context_id.map(str::to_owned),
-        }),
+        user_id,
+        update_type as i32,
+        folder_id,
+        revision_date,
+        context_id,
     )
-    .await
+    .await;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -447,20 +422,28 @@ pub async fn publish_cipher_update(
     revision_date: Option<&str>,
     context_id: Option<&str>,
 ) -> Result<(), AppError> {
-    publish_internal(
+    let ws_bytes = build_cipher_update_message(
+        update_type as i32,
+        cipher_id,
+        payload_user_id,
+        organization_id,
+        collection_ids,
+        revision_date,
+        context_id,
+    );
+    let selector = PublishSelector::user(selector_user_id);
+    send_ws_to_do(env, &selector, &ws_bytes).await?;
+    push::push_cipher_update(
         env,
-        &InternalPublishRequest::CipherUpdate(CipherUpdatePublish {
-            user_id: selector_user_id.to_string(),
-            update_type: update_type as i32,
-            cipher_id: cipher_id.to_string(),
-            payload_user_id: payload_user_id.map(str::to_owned),
-            organization_id: organization_id.map(str::to_owned),
-            collection_ids,
-            revision_date: revision_date.map(str::to_owned),
-            context_id: context_id.map(str::to_owned),
-        }),
+        selector_user_id,
+        update_type as i32,
+        cipher_id,
+        payload_user_id,
+        revision_date,
+        context_id,
     )
-    .await
+    .await;
+    Ok(())
 }
 
 pub async fn publish_send_update(
@@ -471,17 +454,20 @@ pub async fn publish_send_update(
     payload_user_id: Option<&str>,
     revision_date: &str,
 ) -> Result<(), AppError> {
-    publish_internal(
+    let ws_bytes =
+        build_send_update_message(update_type as i32, send_id, payload_user_id, revision_date);
+    let selector = PublishSelector::user(selector_user_id);
+    send_ws_to_do(env, &selector, &ws_bytes).await?;
+    push::push_send_update(
         env,
-        &InternalPublishRequest::SendUpdate(SendUpdatePublish {
-            user_id: selector_user_id.to_string(),
-            update_type: update_type as i32,
-            send_id: send_id.to_string(),
-            payload_user_id: payload_user_id.map(str::to_owned),
-            revision_date: revision_date.to_string(),
-        }),
+        selector_user_id,
+        update_type as i32,
+        send_id,
+        payload_user_id,
+        revision_date,
     )
-    .await
+    .await;
+    Ok(())
 }
 
 pub async fn publish_auth_request(
@@ -490,15 +476,11 @@ pub async fn publish_auth_request(
     auth_request_id: &str,
     context_id: Option<&str>,
 ) -> Result<(), AppError> {
-    publish_internal(
-        env,
-        &InternalPublishRequest::AuthRequest(AuthRequestPublish {
-            user_id: user_id.to_string(),
-            auth_request_id: auth_request_id.to_string(),
-            context_id: context_id.map(str::to_owned),
-        }),
-    )
-    .await
+    let ws_bytes = build_auth_request_message(user_id, auth_request_id, context_id);
+    let selector = PublishSelector::user(user_id);
+    send_ws_to_do(env, &selector, &ws_bytes).await?;
+    push::push_auth_request(env, user_id, auth_request_id, context_id).await;
+    Ok(())
 }
 
 pub async fn publish_auth_response(
@@ -507,15 +489,11 @@ pub async fn publish_auth_response(
     auth_request_id: &str,
     context_id: Option<&str>,
 ) -> Result<(), AppError> {
-    publish_internal(
-        env,
-        &InternalPublishRequest::AuthResponse(AuthResponsePublish {
-            user_id: user_id.to_string(),
-            auth_request_id: auth_request_id.to_string(),
-            context_id: context_id.map(str::to_owned),
-        }),
-    )
-    .await
+    let ws_bytes = build_auth_response_message(user_id, auth_request_id, context_id);
+    let selector = PublishSelector::user(user_id);
+    send_ws_to_do(env, &selector, &ws_bytes).await?;
+    push::push_auth_response(env, user_id, auth_request_id, context_id).await;
+    Ok(())
 }
 
 pub async fn publish_anonymous_update(
@@ -524,47 +502,9 @@ pub async fn publish_anonymous_update(
     user_id: &str,
     auth_request_id: &str,
 ) -> Result<(), AppError> {
-    publish_internal(
-        env,
-        &InternalPublishRequest::AnonymousAuthResponse(AnonymousAuthResponsePublish {
-            token: token.to_string(),
-            user_id: user_id.to_string(),
-            auth_request_id: auth_request_id.to_string(),
-        }),
-    )
-    .await
-}
-
-pub async fn publish_internal(env: &Env, request: &InternalPublishRequest) -> Result<(), AppError> {
-    let namespace = env.durable_object("NOTIFY_DO").map_err(AppError::Worker)?;
-    let stub = namespace.get_by_name("global").map_err(AppError::Worker)?;
-    let body = serde_json::to_string(request).map_err(|_| AppError::Internal)?;
-
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_body(Some(JsValue::from_str(&body)));
-
-    let mut request =
-        Request::new_with_init(INTERNAL_PUBLISH_URL, &init).map_err(AppError::Worker)?;
-    request
-        .headers_mut()
-        .map_err(AppError::Worker)?
-        .set("Content-Type", "application/json")
-        .map_err(AppError::Worker)?;
-
-    let mut response = stub
-        .fetch_with_request(request)
-        .await
-        .map_err(AppError::Worker)?;
-    if !(200..300).contains(&response.status_code()) {
-        let body = response.text().await.unwrap_or_else(|_| String::new());
-        return Err(AppError::Worker(worker::Error::RustError(format!(
-            "NotifyDo publish failed with status {}: {}",
-            response.status_code(),
-            body
-        ))));
-    }
-
+    let ws_bytes = build_anonymous_auth_response_message(user_id, auth_request_id);
+    let selector = PublishSelector::anonymous(token);
+    send_ws_to_do(env, &selector, &ws_bytes).await?;
     Ok(())
 }
 

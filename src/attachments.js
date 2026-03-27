@@ -412,11 +412,10 @@ export async function handleAzureUpload(request, env, cipherId, attachmentId, to
     try {
       const id = env.NOTIFY_DO.idFromName("global");
       const stub = env.NOTIFY_DO.get(id);
-      const response = await stub.fetch("https://notify.internal/publish", {
+      const response = await stub.fetch("https://notify.internal/publish-js-cipher", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          kind: "cipher_update",
           userId,
           updateType: 0, // SyncCipherUpdate
           cipherId,

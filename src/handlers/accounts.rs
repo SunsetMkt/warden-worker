@@ -1149,6 +1149,8 @@ pub async fn post_sstamp(
     .run()
     .await?;
 
+    // Logout push for mobile devices will be skiped since the records of devices are deleted.
+    // This behavior is aligned with Vaultwarden.
     if let Err(error) = notifications::publish_user_logout(env.as_ref(), user_id, &now, None).await
     {
         log::error!("Failed to publish security-stamp LogOut notification: {error}");

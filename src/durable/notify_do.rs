@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use worker::{
     durable_object, DurableObject, Env, Method, Request, Response, Result, State, WebSocket,
     WebSocketIncomingMessage, WebSocketPair,
@@ -8,8 +7,7 @@ use worker::{
 use crate::{
     auth, db,
     notifications::{
-        self, AuthRequestPublish, AuthResponsePublish, ConnectionAttachment,
-        InternalPublishRequest, PublishSelector, ANONYMOUS_KIND_TAG, INITIAL_RESPONSE,
+        self, ConnectionAttachment, PublishSelector, ANONYMOUS_KIND_TAG, INITIAL_RESPONSE,
         USER_KIND_TAG,
     },
     push,
@@ -29,10 +27,29 @@ struct HubQuery {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PublishStats {
+struct FanoutStats {
     matched: usize,
     sent: usize,
     pruned: usize,
+}
+
+#[derive(Deserialize)]
+struct DoFanoutRequest {
+    selector: PublishSelector,
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsCipherPublishRequest {
+    user_id: String,
+    update_type: i32,
+    cipher_id: String,
+    payload_user_id: Option<String>,
+    organization_id: Option<String>,
+    collection_ids: Option<Vec<String>>,
+    revision_date: Option<String>,
+    context_id: Option<String>,
 }
 
 impl DurableObject for NotifyDo {
@@ -51,7 +68,8 @@ impl DurableObject for NotifyDo {
             (Method::Get, "/notifications/anonymous-hub") | (Method::Get, "/anonymous-hub") => {
                 self.handle_anonymous_hub(req).await
             }
-            (Method::Post, "/publish") => self.handle_publish(&mut req).await,
+            (Method::Post, "/fanout") => self.handle_fanout(&mut req).await,
+            (Method::Post, "/publish-js-cipher") => self.handle_js_cipher_publish(&mut req).await,
             _ => Response::error("Not found", 404),
         }
     }
@@ -169,112 +187,64 @@ impl NotifyDo {
         Response::from_websocket(pair.client)
     }
 
-    // ── Unified publish handler ─────────────────────────────────────
+    // ── Fan-out (pre-built bytes from Worker) ───────────────────────
 
-    async fn handle_publish(&self, req: &mut Request) -> Result<Response> {
-        let command = match req.json::<InternalPublishRequest>().await {
-            Ok(command) => command,
-            Err(error) => {
-                log::warn!("NotifyDo received invalid publish payload: {error}");
-                return Response::error("Invalid publish payload", 400);
-            }
-        };
+    async fn handle_fanout(&self, req: &mut Request) -> Result<Response> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
 
-        let (selector, ws_message) = self.build_ws_from_command(&command);
-        let stats = self.ws_fanout(&selector, &ws_message);
+        let body: DoFanoutRequest = req.json().await.map_err(|e| {
+            log::warn!("Invalid fanout payload: {e}");
+            worker::Error::RustError("Invalid fanout payload".into())
+        })?;
 
-        match push::push_config(&self.env) {
-            Ok(Some(cfg)) => {
-                if let Err(error) = self.try_push_relay(&cfg, &command).await {
-                    log::warn!("Push relay notification failed: {error}");
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                log::error!("Push config error (misconfigured?): {error}");
-            }
-        }
+        let ws_bytes = STANDARD.decode(&body.message).map_err(|e| {
+            log::warn!("Invalid base64 in fanout message: {e}");
+            worker::Error::RustError("Invalid base64".into())
+        })?;
+
+        let stats = self.ws_fanout(&body.selector, &ws_bytes);
+        Response::from_json(&stats)
+    }
+
+    // ── JS attachment upload path (builds WS + push in DO) ──────────
+
+    async fn handle_js_cipher_publish(&self, req: &mut Request) -> Result<Response> {
+        let cmd: JsCipherPublishRequest = req.json().await.map_err(|e| {
+            log::warn!("Invalid JS cipher publish payload: {e}");
+            worker::Error::RustError("Invalid payload".into())
+        })?;
+
+        let ws_bytes = notifications::build_cipher_update_message(
+            cmd.update_type,
+            &cmd.cipher_id,
+            cmd.payload_user_id.as_deref(),
+            cmd.organization_id.as_deref(),
+            cmd.collection_ids.clone(),
+            cmd.revision_date.as_deref(),
+            cmd.context_id.as_deref(),
+        );
+
+        let selector = PublishSelector::user(&cmd.user_id);
+        let stats = self.ws_fanout(&selector, &ws_bytes);
+
+        push::push_cipher_update(
+            &self.env,
+            &cmd.user_id,
+            cmd.update_type,
+            &cmd.cipher_id,
+            cmd.payload_user_id.as_deref(),
+            cmd.revision_date.as_deref(),
+            cmd.context_id.as_deref(),
+        )
+        .await;
 
         Response::from_json(&stats)
     }
 
-    // ── WS message building ─────────────────────────────────────────
-
-    fn build_ws_from_command(
-        &self,
-        command: &InternalPublishRequest,
-    ) -> (PublishSelector, Vec<u8>) {
-        match command {
-            InternalPublishRequest::UserUpdate(cmd) => (
-                PublishSelector::user(&cmd.user_id),
-                notifications::build_user_update_message(
-                    cmd.update_type,
-                    &cmd.user_id,
-                    &cmd.date,
-                    cmd.context_id.as_deref(),
-                ),
-            ),
-            InternalPublishRequest::FolderUpdate(cmd) => (
-                PublishSelector::user(&cmd.user_id),
-                notifications::build_folder_update_message(
-                    cmd.update_type,
-                    &cmd.folder_id,
-                    &cmd.user_id,
-                    &cmd.revision_date,
-                    cmd.context_id.as_deref(),
-                ),
-            ),
-            InternalPublishRequest::CipherUpdate(cmd) => (
-                PublishSelector::user(&cmd.user_id),
-                notifications::build_cipher_update_message(
-                    cmd.update_type,
-                    &cmd.cipher_id,
-                    cmd.payload_user_id.as_deref(),
-                    cmd.organization_id.as_deref(),
-                    cmd.collection_ids.clone(),
-                    cmd.revision_date.as_deref(),
-                    cmd.context_id.as_deref(),
-                ),
-            ),
-            InternalPublishRequest::SendUpdate(cmd) => (
-                PublishSelector::user(&cmd.user_id),
-                notifications::build_send_update_message(
-                    cmd.update_type,
-                    &cmd.send_id,
-                    cmd.payload_user_id.as_deref(),
-                    &cmd.revision_date,
-                ),
-            ),
-            InternalPublishRequest::AuthRequest(cmd) => (
-                PublishSelector::user(&cmd.user_id),
-                notifications::build_auth_request_message(
-                    &cmd.user_id,
-                    &cmd.auth_request_id,
-                    cmd.context_id.as_deref(),
-                ),
-            ),
-            InternalPublishRequest::AuthResponse(cmd) => (
-                PublishSelector::user(&cmd.user_id),
-                notifications::build_auth_response_message(
-                    &cmd.user_id,
-                    &cmd.auth_request_id,
-                    cmd.context_id.as_deref(),
-                ),
-            ),
-            InternalPublishRequest::AnonymousAuthResponse(cmd) => (
-                PublishSelector::anonymous(&cmd.token),
-                notifications::build_anonymous_auth_response_message(
-                    &cmd.user_id,
-                    &cmd.auth_request_id,
-                ),
-            ),
-        }
-    }
-
     // ── WS fan-out ──────────────────────────────────────────────────
 
-    fn ws_fanout(&self, selector: &PublishSelector, message: &[u8]) -> PublishStats {
-        let mut stats = PublishStats {
+    fn ws_fanout(&self, selector: &PublishSelector, message: &[u8]) -> FanoutStats {
+        let mut stats = FanoutStats {
             matched: 0,
             sent: 0,
             pruned: 0,
@@ -312,136 +282,6 @@ impl NotifyDo {
         stats
     }
 
-    // ── Push relay integration ──────────────────────────────────────
-
-    async fn try_push_relay(
-        &self,
-        cfg: &push::PushConfig,
-        command: &InternalPublishRequest,
-    ) -> std::result::Result<(), crate::error::AppError> {
-        // Vaultwarden skips org-scoped or multi-user cipher fan-out
-        // In this project, org feature is not supported, so we skip the check
-
-        let (user_id, context_id) = match command {
-            InternalPublishRequest::UserUpdate(cmd) => (&cmd.user_id, cmd.context_id.as_deref()),
-            InternalPublishRequest::FolderUpdate(cmd) => (&cmd.user_id, cmd.context_id.as_deref()),
-            InternalPublishRequest::CipherUpdate(cmd) => (&cmd.user_id, cmd.context_id.as_deref()),
-            InternalPublishRequest::SendUpdate(cmd) => (&cmd.user_id, None),
-            InternalPublishRequest::AuthRequest(cmd) => (&cmd.user_id, cmd.context_id.as_deref()),
-            InternalPublishRequest::AuthResponse(cmd) => (&cmd.user_id, cmd.context_id.as_deref()),
-            InternalPublishRequest::AnonymousAuthResponse(_) => return Ok(()),
-        };
-
-        if !self.user_has_push_device(user_id).await? {
-            return Ok(());
-        }
-
-        let device_info = if let Some(ctx_id) = context_id {
-            self.lookup_device_push_info(user_id, ctx_id).await?
-        } else {
-            None
-        };
-        let device_ref = device_info.as_ref().map(|d| push::DevicePushInfo {
-            push_uuid: d.push_uuid.clone(),
-            identifier: d.identifier.clone(),
-        });
-
-        let payload = self.build_push_payload(command, device_ref.as_ref());
-        push::send_to_push_relay(cfg, &payload).await
-    }
-
-    fn build_push_payload(
-        &self,
-        command: &InternalPublishRequest,
-        device: Option<&push::DevicePushInfo>,
-    ) -> JsonValue {
-        match command {
-            InternalPublishRequest::CipherUpdate(cmd) => push::build_cipher_push_payload(
-                &cmd.user_id,
-                &cmd.cipher_id,
-                cmd.payload_user_id.as_deref(),
-                cmd.revision_date.as_deref(),
-                cmd.update_type,
-                device,
-            ),
-            InternalPublishRequest::UserUpdate(cmd) => {
-                push::build_user_push_payload(&cmd.user_id, &cmd.date, cmd.update_type, device)
-            }
-            InternalPublishRequest::FolderUpdate(cmd) => push::build_folder_push_payload(
-                &cmd.user_id,
-                &cmd.folder_id,
-                &cmd.revision_date,
-                cmd.update_type,
-                device,
-            ),
-            InternalPublishRequest::SendUpdate(cmd) => push::build_send_push_payload(
-                &cmd.user_id,
-                &cmd.send_id,
-                cmd.payload_user_id.as_deref(),
-                &cmd.revision_date,
-                cmd.update_type,
-                device,
-            ),
-            InternalPublishRequest::AuthRequest(cmd) => push::build_auth_request_push_payload(
-                &cmd.user_id,
-                &cmd.auth_request_id,
-                cmd.update_type(),
-                device,
-            ),
-            InternalPublishRequest::AuthResponse(cmd) => push::build_auth_request_push_payload(
-                &cmd.user_id,
-                &cmd.auth_request_id,
-                cmd.update_type(),
-                device,
-            ),
-            InternalPublishRequest::AnonymousAuthResponse(_) => {
-                unreachable!("anonymous events don't go through push relay")
-            }
-        }
-    }
-
-    async fn user_has_push_device(
-        &self,
-        user_id: &str,
-    ) -> std::result::Result<bool, crate::error::AppError> {
-        let db = self
-            .env
-            .d1("vault1")
-            .map_err(crate::error::AppError::Worker)?;
-        let count: Option<f64> = db
-            .prepare(
-                "SELECT COUNT(*) as cnt FROM devices WHERE user_id = ?1 AND push_token IS NOT NULL",
-            )
-            .bind(&[user_id.into()])
-            .map_err(crate::error::AppError::Worker)?
-            .first(Some("cnt"))
-            .await
-            .map_err(|_| crate::error::AppError::Database)?;
-        Ok(count.unwrap_or(0.0) > 0.0)
-    }
-
-    async fn lookup_device_push_info(
-        &self,
-        user_id: &str,
-        device_identifier: &str,
-    ) -> std::result::Result<Option<push::DevicePushInfo>, crate::error::AppError> {
-        let db = self
-            .env
-            .d1("vault1")
-            .map_err(crate::error::AppError::Worker)?;
-        let row: Option<JsonValue> = db
-            .prepare(
-                "SELECT push_uuid, identifier FROM devices WHERE identifier = ?1 AND user_id = ?2",
-            )
-            .bind(&[device_identifier.into(), user_id.into()])
-            .map_err(crate::error::AppError::Worker)?
-            .first(None)
-            .await
-            .map_err(|_| crate::error::AppError::Database)?;
-
-        Ok(row.and_then(|r| serde_json::from_value(r).ok()))
-    }
-
     // ── Utility ─────────────────────────────────────────────────────
 
     fn deserialize_attachment(&self, ws: &WebSocket) -> Option<ConnectionAttachment> {
@@ -467,22 +307,5 @@ impl NotifyDo {
             .flatten()
             .map(|value| value.eq_ignore_ascii_case("websocket"))
             .unwrap_or(false)
-    }
-}
-
-// Helper trait to get update_type from auth request/response commands
-trait HasUpdateType {
-    fn update_type(&self) -> i32;
-}
-
-impl HasUpdateType for AuthRequestPublish {
-    fn update_type(&self) -> i32 {
-        notifications::UpdateType::AuthRequest as i32
-    }
-}
-
-impl HasUpdateType for AuthResponsePublish {
-    fn update_type(&self) -> i32 {
-        notifications::UpdateType::AuthRequestResponse as i32
     }
 }
