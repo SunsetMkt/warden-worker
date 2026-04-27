@@ -100,6 +100,9 @@ const HEAVY_DO_ROUTE_METHODS = new Map([
   ["/api/accounts", new Set(["DELETE"])],
   ["/api/ciphers/purge", new Set(["POST"])],
 
+  // Security stamp rotation requires password verification
+  ["/api/accounts/security-stamp", new Set(["POST"])],
+
   // Key rotation needs verify master password and update entire vault
   ["/api/accounts/key-management/rotate-user-account-keys", new Set(["POST"])],
 
